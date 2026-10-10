@@ -4,5 +4,4 @@ numpy==2.5.3
 pillow==11.3.0
 pyinstaller==6.22.3
 pystray==0.19.5
-sherpa_onnx==1.13.8
 sounddevice==0.5.6

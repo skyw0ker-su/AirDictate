@@ -1454,7 +1454,7 @@ def supervise():
 
 
 def self_check():
-    """Самопроверка (AirDictate.exe --check): окно Claude, кнопка диктовки, модель речи. Результат - в журнал."""
+    """Самопроверка (AirDictate.exe --check): окно Claude и кнопка диктовки. Результат - в журнал."""
     log("самопроверка: начало")
     try:
         hwnd = claude_window()
@@ -1463,16 +1463,6 @@ def self_check():
             log("кнопка диктовки:", find_mic(hwnd, load_cfg()["mic_button_pattern"], tries=6))
     except Exception as e:
         log("самопроверка окна: ошибка", repr(e))
-    try:
-        import sherpa_onnx
-        m = os.path.join(ASSETS, "vosk-model-small-ru")
-        sherpa_onnx.OfflineRecognizer.from_transducer(
-            encoder=os.path.join(m, "am", "encoder.onnx"), decoder=os.path.join(m, "am", "decoder.onnx"),
-            joiner=os.path.join(m, "am", "joiner.onnx"), tokens=os.path.join(m, "lang", "tokens.txt"),
-            num_threads=2, sample_rate=16000, decoding_method="greedy_search")
-        log("модель речи: загружена")
-    except Exception as e:
-        log("модель речи: ошибка", repr(e))
     log("самопроверка: конец")
 
 
