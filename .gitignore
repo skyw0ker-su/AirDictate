@@ -6,7 +6,6 @@
 !CHANGELOG.md
 !*.py
 !*.ps1
-!*.bat
 !build.ps1
 !requirements.txt
 !LICENSE
@@ -24,3 +23,7 @@ crash.log
 stopped.flag
 testserver_setup.ps1
 __pycache__/
+
+# .bat-файлы - только на компьютере автора, в репозиторий не входят
+start.bat
+stop.bat
