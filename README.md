@@ -66,7 +66,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 ## Автор
 
-Скайвокер (GitHub: [skyw0ker-su](https://github.com/skyw0ker-su)). Это мой проект, и я открываю его код для всех.
+Skyw0ker (GitHub: [skyw0ker-su](https://github.com/skyw0ker-su)). Это мой проект, и я открываю его код для всех.
 
 ## Лицензия
 
