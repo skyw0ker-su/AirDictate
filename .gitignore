@@ -9,6 +9,10 @@
 !*.bat
 !build.ps1
 !requirements.txt
+!docs/
+!docs/*.md
+!docs/images/
+!docs/images/*.png
 
 # личное / не для репозитория
 config.json
