@@ -1,0 +1,20 @@
+# В репозиторий попадает только исходный код и документация. Всё остальное закрыто:
+# личные настройки, журналы, история отправок, видео, музыка, модели, сборки.
+*
+!.gitignore
+!README.md
+!CHANGELOG.md
+!*.py
+!*.ps1
+!*.bat
+!build.ps1
+!requirements.txt
+
+# личное / не для репозитория
+config.json
+sent_history.json
+*.log
+crash.log
+stopped.flag
+testserver_setup.ps1
+__pycache__/
