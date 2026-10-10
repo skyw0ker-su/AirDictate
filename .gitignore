@@ -9,6 +9,7 @@
 !*.bat
 !build.ps1
 !requirements.txt
+!LICENSE
 !docs/
 !docs/*.md
 !docs/images/
