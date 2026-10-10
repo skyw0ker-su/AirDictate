@@ -10,6 +10,7 @@
 !build.ps1
 !requirements.txt
 !LICENSE
+!installer.iss
 !docs/
 !docs/*.md
 !docs/images/
