@@ -229,6 +229,9 @@ def render_widget(top):
     return max(res)[2] if res else None
 
 _last_mic = None  # (прямоугольник окна, точка кнопки) с прошлого удачного поиска
+# Claude умеет делить экран на панели (сессия и тред рядом), у каждой своё поле ввода и своя кнопка диктовки.
+# Здесь (левый, правый) край поля той панели, куда идёт диктовка: чтение текста, Enter и «Остановить» идут туда же.
+_pane = None
 
 
 def _window_rect(hwnd):
@@ -237,14 +240,53 @@ def _window_rect(hwnd):
     return (r.left, r.top, r.right, r.bottom)
 
 
+def _prompts(ia, UIA, root):
+    """Поля ввода Claude («Промпт») с прямоугольниками: [(элемент, (л, в, п, н))]. Видимые, а если таких нет - все."""
+    cond = ia.CreatePropertyCondition(UIA.UIA_ControlTypePropertyId, UIA.UIA_EditControlTypeId)
+    arr = root.FindAll(UIA.TreeScope_Descendants, cond)
+    shown, hidden = [], []
+    for i in range(arr.Length):
+        try:
+            e = arr.GetElement(i)
+            if (e.CurrentName or "").strip().lower() not in ("промпт", "prompt"):
+                continue
+            r = e.CurrentBoundingRectangle
+            (hidden if e.CurrentIsOffscreen else shown).append((e, (r.left, r.top, r.right, r.bottom)))
+        except comtypes.COMError:
+            pass   # элемент пропал во время перерисовки
+    return shown or hidden
+
+
+def _x_gap(x, rc):
+    """На сколько пикселей точка левее или правее прямоугольника (0 - она над ним)."""
+    return max(rc[0] - x, 0, x - rc[2])
+
+
+def _pick_prompt(prompts):
+    """Поле панели, куда диктуем. Если панелей несколько: та, что запомнена для текущей записи;
+    иначе та, над которой стоит курсор (пультом показали, куда диктовать). Курсор над боковым меню
+    или между панелями - ближайшая по горизонтали."""
+    if len(prompts) <= 1:
+        return prompts[0] if prompts else None
+    if _pane:
+        mid = (_pane[0] + _pane[1]) // 2
+        for p in prompts:
+            if p[1][0] <= mid <= p[1][2]:
+                return p
+    x = cursor()[0]
+    return min(prompts, key=lambda p: _x_gap(x, p[1]))
+
+
 def find_mic(hwnd, pattern, tries=12):
     """Центр кнопки диктовки в окне Claude (физические пиксели) или None.
 
     Дерево доступности Chromium бывает недоступно на мгновения: после
     восстановления окна и пока Claude перерисовывает ответ. Поэтому много
     коротких попыток. Старую позицию не подставляем: раскладка внутри окна могла измениться.
+    Если экран разделён на панели, берём кнопку панели из _pick_prompt и запоминаем эту панель в _pane;
+    кнопку чужой панели не берём никогда (лучше ещё одна попытка, чем диктовка не туда).
     """
-    global _last_mic
+    global _last_mic, _pane
     ia, UIA = _uia()
     pat = re.compile(pattern, re.I)
     for _ in range(tries):
@@ -254,6 +296,7 @@ def find_mic(hwnd, pattern, tries=12):
                 root = ia.ElementFromHandle(rw)
                 cond = ia.CreatePropertyCondition(UIA.UIA_ControlTypePropertyId, UIA.UIA_ButtonControlTypeId)
                 arr = root.FindAll(UIA.TreeScope_Descendants, cond)
+                found = []
                 for i in range(arr.Length):
                     try:
                         e = arr.GetElement(i)
@@ -263,9 +306,21 @@ def find_mic(hwnd, pattern, tries=12):
                     except comtypes.COMError:
                         continue  # элемент пропал во время перерисовки
                     if r.right > r.left and r.bottom > r.top:
-                        pt = ((r.left + r.right) // 2, (r.top + r.bottom) // 2)
-                        _last_mic = (_window_rect(hwnd), pt)
-                        return pt
+                        found.append(((r.left + r.right) // 2, (r.top + r.bottom) // 2))
+                pt = None
+                prompts = _prompts(ia, UIA, root) if found else []
+                if len(prompts) > 1:
+                    target = _pick_prompt(prompts)[1]
+                    _pane = (target[0], target[2])
+                    # кнопка панели стоит под её полем ввода или в нём, по горизонтали в пределах поля
+                    mine = [p for p in found if _x_gap(p[0], target) <= 40]
+                    if mine:
+                        pt = min(mine, key=lambda p: abs(p[1] - (target[1] + target[3]) // 2))
+                elif found:
+                    pt = found[0]
+                if pt:
+                    _last_mic = (_window_rect(hwnd), pt)
+                    return pt
         except comtypes.COMError:
             pass
         time.sleep(0.25)
@@ -275,14 +330,10 @@ def read_prompt(hwnd):
     """(текст, в_фокусе) поля ввода Claude («Промпт») или None, если не удалось прочитать."""
     try:
         ia, UIA = _uia()
-        root = ia.ElementFromHandle(render_widget(hwnd))
-        cond = ia.CreatePropertyCondition(UIA.UIA_ControlTypePropertyId, UIA.UIA_EditControlTypeId)
-        arr = root.FindAll(UIA.TreeScope_Descendants, cond)
-        for i in range(arr.Length):
-            e = arr.GetElement(i)
-            if (e.CurrentName or "").strip().lower() in ("промпт", "prompt"):
-                vp = e.GetCurrentPattern(UIA.UIA_ValuePatternId).QueryInterface(UIA.IUIAutomationValuePattern)
-                return vp.CurrentValue or "", bool(e.CurrentHasKeyboardFocus)
+        p = _pick_prompt(_prompts(ia, UIA, ia.ElementFromHandle(render_widget(hwnd))))
+        if p:
+            vp = p[0].GetCurrentPattern(UIA.UIA_ValuePatternId).QueryInterface(UIA.IUIAutomationValuePattern)
+            return vp.CurrentValue or "", bool(p[0].CurrentHasKeyboardFocus)
     except Exception:
         pass
     return None
@@ -317,38 +368,27 @@ def describe_bottom(hwnd, limit=14):
 
 
 def focus_prompt(hwnd):
-    """Поставить фокус клавиатуры в поле ввода («Промпт»). Нужен, если фокус остался на кнопке микрофона."""
+    """Поставить фокус клавиатуры в поле ввода («Промпт») нашей панели. Нужен, если фокус остался
+    на кнопке микрофона или в другой панели."""
     try:
         ia, UIA = _uia()
-        root = ia.ElementFromHandle(render_widget(hwnd))
-        cond = ia.CreatePropertyCondition(UIA.UIA_ControlTypePropertyId, UIA.UIA_EditControlTypeId)
-        arr = root.FindAll(UIA.TreeScope_Descendants, cond)
-        for i in range(arr.Length):
-            e = arr.GetElement(i)
-            if (e.CurrentName or "").strip().lower() in ("промпт", "prompt") and not e.CurrentIsOffscreen:
-                e.SetFocus()
-                time.sleep(0.15)
-                return True
+        p = _pick_prompt(_prompts(ia, UIA, ia.ElementFromHandle(render_widget(hwnd))))
+        if p:
+            p[0].SetFocus()
+            time.sleep(0.15)
+            return True
     except Exception:
         pass
     return False
 
 
-def prompt_rect(hwnd):
-    """Прямоугольник поля ввода Claude («Промпт») в физических пикселях или None."""
+def prompt_rects(hwnd):
+    """Прямоугольники всех полей ввода Claude («Промпт») в физических пикселях (в разделённом виде их несколько)."""
     try:
         ia, UIA = _uia()
-        root = ia.ElementFromHandle(render_widget(hwnd))
-        cond = ia.CreatePropertyCondition(UIA.UIA_ControlTypePropertyId, UIA.UIA_EditControlTypeId)
-        arr = root.FindAll(UIA.TreeScope_Descendants, cond)
-        for i in range(arr.Length):
-            e = arr.GetElement(i)
-            if (e.CurrentName or "").strip().lower() in ("промпт", "prompt") and not e.CurrentIsOffscreen:
-                r = e.CurrentBoundingRectangle
-                return r.left, r.top, r.right, r.bottom
+        return [p[1] for p in _prompts(ia, UIA, ia.ElementFromHandle(render_widget(hwnd)))]
     except Exception:
-        pass
-    return None
+        return []
 
 
 class PromptHover:
@@ -375,11 +415,10 @@ class PromptHover:
             try:
                 hwnd = claude_window()
                 if hwnd and user32.GetForegroundWindow() == hwnd:
-                    rc = prompt_rect(hwnd)
-                    if rc:
-                        x, y = cursor()
-                        m = self.MARGIN
-                        inside = rc[0] - m <= x <= rc[2] + m and rc[1] - m <= y <= rc[3] + m
+                    x, y = cursor()
+                    m = self.MARGIN
+                    inside = any(rc[0] - m <= x <= rc[2] + m and rc[1] - m <= y <= rc[3] + m
+                                 for rc in prompt_rects(hwnd))
             except Exception:
                 inside = False
             self.inside = inside
@@ -1064,12 +1103,16 @@ class Recorder:
             self._start()
 
     def _start(self):
+        global _pane
         hwnd = claude_window()
         if not hwnd:
             log("Окно Claude не найдено")
             return
         focus(hwnd)
+        _pane = None   # панель выбираем заново при каждой записи: ту, над которой курсор
         pt = find_mic(hwnd, self.cfg["mic_button_pattern"], tries=36)   # до ~9 с: окно может «просыпаться»
+        if pt and _pane:
+            log("экран Claude разделён на панели: диктую в панель x=%d…%d" % _pane)
         if not pt:
             # в активном окне кнопки нет (другой экран приложения): пробуем остальные окна Claude
             for other in claude_windows():
@@ -1234,6 +1277,8 @@ class Recorder:
                 return
             focus(hwnd)
             cur = read_prompt(hwnd)
+            if cur is not None and not cur[1] and focus_prompt(hwnd):
+                cur = read_prompt(hwnd) or cur   # фокус ушёл (например, в другую панель Claude): возвращаем в наше поле
             if cur is not None and not cur[1]:
                 log("фокус не в поле ввода - Enter не нажимаю")
                 self.resume_pending = True  # текст остался как черновик

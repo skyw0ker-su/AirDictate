@@ -2,7 +2,7 @@
 ; Ставит программу для текущего пользователя, без прав администратора.
 
 #define AppName "AirDictate"
-#define AppVersion "1.0"
+#define AppVersion "1.0.1"
 #define AppExe "AirDictate.exe"
 
 [Setup]
