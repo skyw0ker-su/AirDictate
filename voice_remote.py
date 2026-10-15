@@ -1027,6 +1027,7 @@ class Recorder:
         self.stop_evt = threading.Event()
         self.saved_cursor = None
         self.stopped_at = 0.0
+        self.speech_end = None   # когда вы замолчали (если запись остановила тишина): для журнала задержки отправки
         self.mic_pt = None
         self.unlock_timer = None
         self.unlocked = False
@@ -1110,6 +1111,7 @@ class Recorder:
             return
         focus(hwnd)
         _pane = None   # панель выбираем заново при каждой записи: ту, над которой курсор
+        self.speech_end = None
         pt = find_mic(hwnd, self.cfg["mic_button_pattern"], tries=36)   # до ~9 с: окно может «просыпаться»
         if pt and _pane:
             log("экран Claude разделён на панели: диктую в панель x=%d…%d" % _pane)
@@ -1266,6 +1268,8 @@ class Recorder:
     def _send_when_ready(self, token):
         """Ждём, пока Claude дораспознает текст, и жмём Enter. Идёт в своём потоке, чтобы пульт
         отзывался сразу; новая запись (token изменился) отменяет отправку."""
+        stopped, speech_end = self.stopped_at, self.speech_end
+        self.speech_end = None
         try:
             hwnd = claude_window()
             if not hwnd:
@@ -1293,6 +1297,7 @@ class Recorder:
             # жмём Enter и проверяем, что сообщение правда ушло (поле опустело); иначе повторяем
             gone = False
             for attempt in (1, 2):
+                entered = time.time()
                 user32.keybd_event(VK_RETURN, 0, 0, 0)
                 user32.keybd_event(VK_RETURN, 0, KEYEVENTF_KEYUP, 0)
                 time.sleep(0.8)
@@ -1309,6 +1314,13 @@ class Recorder:
                 self.resume_pending = True
                 self._state("paused")
                 return
+            if speech_end:
+                log("✓ отправлено через %.1f с после конца речи (тишина %.1f с + распознавание до Enter %.1f с)"
+                    % (entered - speech_end, stopped - speech_end, entered - stopped))
+            elif 0 < entered - stopped < 60:
+                log("✓ отправлено через %.1f с после остановки (распознавание до Enter)" % (entered - stopped))
+            else:
+                log("✓ отправлено")
             self.sent_texts = (self.sent_texts + [text])[-HISTORY_LIMIT:]
             save_history(self.sent_texts)
             self.resume_pending = False
@@ -1388,6 +1400,7 @@ class Recorder:
                 if now - t0 > c["max_seconds"]:
                     self.stop(send=False); return
                 if state["spoke"] and state["quiet_since"] and now - state["quiet_since"] > c["silence_seconds"]:
+                    self.speech_end = state["quiet_since"]
                     log("тишина, останавливаю"); self.stop(); return
                 if not state["spoke"] and now - t0 > c["no_speech_timeout"]:
                     log("речи не было, отмена"); self.stop(send=False); return
@@ -1858,6 +1871,15 @@ class App:
         threading.Thread(target=self.listen, daemon=True).start()
         self.icon = pystray.Icon("AirDictate", make_icon(STATES["idle"][0]),
                                  "AirDictate: " + STATES["idle"][1], self.menu())
+        # меню и по левому клику: на пульте левый клик - центральная кнопка OK, а правый неудобен
+        try:
+            from pystray._util import win32 as pw
+            on_notify = self.icon._on_notify
+            self.icon._message_handlers[pw.WM_NOTIFY] = lambda w, l: on_notify(
+                w, pw.WM_RBUTTONUP if l == pw.WM_LBUTTONUP else l)
+        except Exception as e:
+            log("меню по левому клику не включено:", repr(e))
+
         def setup(icon):
             icon.visible = True
             log("значок в трее создан, visible =", icon.visible)
