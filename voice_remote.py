@@ -20,6 +20,8 @@ import hid
 import numpy as np
 import sounddevice as sd
 
+import touch_scroll
+
 FROZEN = bool(getattr(sys, "frozen", False))      # собранная программа AirDictate.exe
 # рядом лежат настройки и журнал: у .exe это папка с ним, у скрипта папка скрипта
 HERE = os.path.dirname(os.path.abspath(sys.executable if FROZEN else __file__))
@@ -48,6 +50,15 @@ DEFAULTS = {
     "setup_done": False,
     "min_hold_seconds": 0.8,         # минимум, сколько держим кнопку мыши на микрофоне (короче Claude считает «тапом»)
     "stale_watch_seconds": 4.0,      # сколько секунд после остановки сторож ищет «застрявшую» диктовку в Claude
+    # прокрутка «как на телефоне»: зажали OK и повели пульт - страница едет за рукой (см. touch_scroll.py)
+    "touch_scroll": True,
+    "touch_scroll_speed": 1.0,       # во сколько раз страница едет быстрее руки (меньше 1 - медленнее)
+    "touch_scroll_invert": False,    # True: страница едет в обратную сторону
+    "touch_scroll_inertia": True,    # докатывание после отпускания
+    "touch_scroll_px_per_notch": 0,  # сколько пикселей пути указателя = одно деление колеса (0 = по масштабу экрана)
+    "touch_threshold_px": 30,        # на сколько сдвинуть пульт, чтобы это считалось прокруткой, а не долгим нажатием
+    "touch_long_press": 0.4,         # сколько держать OK без движения, чтобы включилось выделение и перетаскивание
+    "touch_beep": True,              # короткий сигнал, когда включилось долгое нажатие
 }
 
 user32 = ctypes.windll.user32
@@ -458,9 +469,11 @@ class ClickWatcher:
         _fields_ = [("pt", wintypes.POINT), ("mouseData", wintypes.DWORD), ("flags", wintypes.DWORD),
                     ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_void_p)]
 
-    def __init__(self, remote_tag=None):
+    def __init__(self, remote_tag=None, cfg=None):
         self.event = threading.Event()
         self.key_rules = {}  # vk -> (условие, действие): клавиша «проглатывается», если условие истинно
+        self.touch = None     # жест «как на телефоне» (touch_scroll.py); без настроек (мастер) его нет
+        self._mouse_remote = False   # последнее движение или нажатие мыши пришло с пульта (Raw Input)
         self.enabled = True   # False: все подмены клавиш выключены, клавиши идут как обычно
         self.hold_keys = {}  # vk -> (при_нажатии, при_отпускании): клавиша целиком подменяется (например, Menu -> правая кнопка)
         self.remote_tag = remote_tag      # например "vid_4842&pid_0001"; None = реагировать на любую клавиатуру
@@ -470,6 +483,11 @@ class ClickWatcher:
         self._last_open = 0.0
         self._dev_cache = {}
         self.dev_names = {}   # hDevice -> имя устройства (для мастера настройки)
+        if cfg is not None and remote_tag:   # без признака пульта не отличить его от обычной мыши
+            try:
+                self.touch = touch_scroll.create(self, cfg, log)
+            except Exception as e:
+                log("прокрутка «как на телефоне» не включена:", repr(e))
         threading.Thread(target=self._loop, daemon=True).start()
         # Raw Input обрабатывается в ОТДЕЛЬНОМ потоке: поток хука, пока ждёт ответа, не может разбирать сообщения
         threading.Thread(target=self._raw_loop, daemon=True).start()
@@ -503,9 +521,17 @@ class ClickWatcher:
                                                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
             hwnd = user32.CreateWindowExW(0, "STATIC", "AirDictateRaw", 0, 0, 0, 0, 0,
                                           ctypes.c_void_p(-3), None, None, None)   # HWND_MESSAGE
-            rid = RID(1, 6, 0x100, hwnd)   # клавиатуры, RIDEV_INPUTSINK: получаем и при чужом фокусе
             user32.RegisterRawInputDevices.argtypes = [ctypes.POINTER(RID), wintypes.UINT, wintypes.UINT]
-            self.raw_ok = bool(hwnd) and bool(user32.RegisterRawInputDevices(ctypes.byref(rid), 1, ctypes.sizeof(RID)))
+            # клавиатуры, RIDEV_INPUTSINK: получаем и при чужом фокусе
+            self.raw_ok = bool(hwnd) and bool(user32.RegisterRawInputDevices(
+                ctypes.byref(RID(1, 6, 0x100, hwnd)), 1, ctypes.sizeof(RID)))
+            if self.raw_ok and self.touch:
+                # мыши: по ним узнаём, с чего пришло движение (пульт или обычная мышь). Отдельной
+                # регистрацией, чтобы сбой здесь не отнял у программы определение клавиш пульта
+                if not user32.RegisterRawInputDevices(ctypes.byref(RID(1, 2, 0x100, hwnd)), 1, ctypes.sizeof(RID)):
+                    log("Raw Input мыши недоступен: прокрутка «как на телефоне» выключена")
+                    self.touch.close()
+                    self.touch = None
         except Exception as e:
             log("Raw Input недоступен:", repr(e))
             self.raw_ok = False
@@ -537,6 +563,10 @@ class ClickWatcher:
             if user32.GetRawInputData(lparam, 0x10000003, buf, ctypes.byref(size), hdr) != size.value:
                 return
             header = self._RAWINPUTHEADER.from_buffer(buf)
+            if header.dwType == 0:   # мышь: запоминаем, пульт ли это (у нашей эмуляции устройства нет, её пропускаем)
+                if header.hDevice:
+                    self._mouse_remote = self._is_remote(header.hDevice)
+                return
             if header.dwType != 1:   # не клавиатура
                 return
             kb = self._RAWKEYBOARD.from_buffer(buf, hdr)
@@ -552,6 +582,10 @@ class ClickWatcher:
                     threading.Thread(target=p[2], daemon=True).start()
         except Exception:
             pass
+
+    def mouse_from_remote(self):
+        """Последнее движение или нажатие мыши пришло с пульта (а не с обычной мыши)?"""
+        return self._mouse_remote
 
     _dbg_last = 0.0
 
@@ -588,10 +622,16 @@ class ClickWatcher:
         user32.CallNextHookEx.restype = ctypes.c_ssize_t
 
         def cb(code, wparam, lparam):
-            if code >= 0 and wparam == self.WM_LBUTTONDOWN:
-                info = ctypes.cast(lparam, ctypes.POINTER(self.MSLLHOOKSTRUCT)).contents
-                if not info.flags & self.LLMHF_INJECTED:
-                    self.event.set()
+            if code >= 0 and wparam in (0x0200, 0x0201, 0x0202):   # движение, левая кнопка вниз и вверх
+                touch = self.touch
+                # движение и отпускание интересны, только пока жест идёт: так хук почти ничего не стоит
+                if wparam == self.WM_LBUTTONDOWN or (touch is not None and touch.state != touch_scroll.IDLE):
+                    info = ctypes.cast(lparam, ctypes.POINTER(self.MSLLHOOKSTRUCT)).contents
+                    if not info.flags & self.LLMHF_INJECTED:
+                        if touch is not None and self.enabled and touch.hook(wparam, info.pt.x, info.pt.y):
+                            return 1   # жест забрал событие: прокрутка «как на телефоне»
+                        if wparam == self.WM_LBUTTONDOWN:
+                            self.event.set()
             return user32.CallNextHookEx(None, code, wparam, lparam)
 
         self._proc = Proc(cb)  # держим ссылку, иначе соберёт сборщик мусора
@@ -1032,7 +1072,7 @@ class Recorder:
         self.unlock_timer = None
         self.unlocked = False
         tag = ("vid_%04x&pid_%04x" % (cfg["vid"], cfg["pid"])) if cfg.get("remote_only_keys", True) else None
-        self.clicks = ClickWatcher(remote_tag=tag)   # стрелки пульта перехватываем только с него
+        self.clicks = ClickWatcher(remote_tag=tag, cfg=cfg)   # стрелки и жест OK перехватываем только с пульта
         self.highlight = Highlight()  # показывается, только если в настройках highlight=true
         self.numpad = Numpad(cfg.get("numpad_theme", "claude-dark"))
         self.hover = PromptHover()  # курсор над строкой ввода: можно печатать цифры с пульта
@@ -1798,6 +1838,8 @@ class App:
                 self.rec._right_up()
             if self.rec.active:
                 user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+            if self.rec.clicks.touch:
+                self.rec.clicks.touch.abort()   # долгое нажатие OK не должно остаться зажатым
             self.rec.numpad.hide()
         except Exception:
             pass
@@ -1857,6 +1899,8 @@ class App:
               checked=lambda item: self.cfg.get("hover_keyboard", True)),
             I("Системный набиратель (в любых полях ввода)", self._toggle("system_keyboard"),
               checked=lambda item: self.cfg.get("system_keyboard", True)),
+            I("Прокрутка как на телефоне (зажать OK и вести)", self._toggle("touch_scroll"),
+              checked=lambda item: self.cfg.get("touch_scroll", True)),
             I("Запускать вместе с Windows", self._toggle_autostart, checked=lambda item: autostart_enabled()),
             pystray.Menu.SEPARATOR,
             I("Мастер настройки пульта…", self._wizard),
