@@ -3,7 +3,8 @@
 Зажали OK и ведёте пульт вверх-вниз: страница едет за рукой (колесо мыши), текст не выделяется,
 указатель стоит на месте. Отпустили: страница плавно докатывается по инерции. Короткое нажатие
 остаётся обычным кликом. Держите OK без движения (по умолчанию 0,4 с): включается обычное зажатие
-мыши, то есть выделение текста и перетаскивание, как раньше.
+мыши, то есть выделение текста и перетаскивание, как раньше. Что оно включилось, показывает кольцо
+у указателя (HoldMark), звук по желанию: звука может не быть.
 
 Жест не вмешивается там, где его быть не должно: обычная мышь, заголовок и рамка окна (окно тянут
 как раньше), полосы прокрутки окон Windows, панель задач и рабочий стол, окна самой программы,
@@ -42,6 +43,7 @@ class TouchScroll:
         self.total = [0.0, 0.0]          # сдвиг с момента нажатия, пока решаем «прокрутка или долгое нажатие»
         self.pending_px = 0.0            # сдвиг по вертикали, ещё не отправленный колесом
         self.pressed = False             # DRAG: настоящее нажатие уже подано в систему
+        self.marked = False              # кольцо у указателя сейчас показано
         self.actions = queue.SimpleQueue()
         self.acc = 0.0                   # дробная часть колеса, не отправленная из-за округления
         self.samples = collections.deque(maxlen=64)   # (время, деления колеса): для скорости инерции
@@ -158,6 +160,15 @@ class TouchScroll:
                 self.env.button(False)
             except Exception:
                 pass
+        self._unmark()
+
+    def _unmark(self):
+        if self.marked:
+            self.marked = False
+            try:
+                self.env.mark(False)
+            except Exception:
+                pass
 
     def close(self):
         self.alive = False
@@ -198,6 +209,7 @@ class TouchScroll:
         elif name == "release":
             self.env.button(False)
             self.pressed = False
+            self._unmark()
         elif name == "fling":
             self._start_fling(t)
 
@@ -209,7 +221,10 @@ class TouchScroll:
             self.state = DRAG
             self.pressed = False
         self.env.notify_click()
-        if self._c("touch_beep", True):
+        if self._c("touch_mark", True):
+            self.marked = True
+            self.env.mark(True)
+        if self._c("touch_beep", False):
             self.env.beep()
         self.env.button(True)
         self.pressed = True
@@ -251,6 +266,87 @@ class TouchScroll:
         self.fling_v = 0.0 if abs(v) < FLING_STOP else v
 
 
+class HoldMark:
+    """Кольцо у указателя, пока включено долгое нажатие (выделение, перетаскивание): видно и без звука.
+
+    Кольцо за 0,2 с «схлопывается» к указателю (понятно, что нажатие сработало), потом идёт за ним.
+    Окно прозрачно для мыши и не берёт фокус, как красное кольцо записи (Highlight в voice_remote.py).
+    Размеры считаются от масштаба экрана: на 4K при 300% кольцо вокруг указателя иначе не разглядеть.
+    """
+    COLOR = "#0a84ff"
+
+    def __init__(self, u, scale=1.0, log=None):
+        self.u, self.s = u, max(1.0, scale)
+        self.log = log or (lambda *a: None)
+        self.q = queue.Queue()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def show(self):
+        self.q.put(True)
+
+    def hide(self):
+        self.q.put(False)
+
+    def _run(self):
+        import ctypes
+        from ctypes import wintypes
+        u, s = self.u, self.s
+        S = int(96 * s)                       # сторона окна
+        c = S // 2
+        r_end, r_start = 14 * s, 36 * s       # радиус кольца у указателя и в начале «схлопывания»
+        width = max(2, int(3 * s))
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+            root.withdraw()
+            win = tk.Toplevel(root)
+            win.overrideredirect(True)
+            win.attributes("-topmost", True)
+            key = "#010101"
+            win.configure(bg=key)
+            win.attributes("-transparentcolor", key)
+            cv = tk.Canvas(win, width=S, height=S, bg=key, highlightthickness=0)
+            cv.pack()
+            win.update_idletasks()
+            top = u.GetParent(win.winfo_id()) or win.winfo_id()
+            # LAYERED | TRANSPARENT (клики насквозь) | NOACTIVATE | TOOLWINDOW
+            u.SetWindowLongW(top, -20, u.GetWindowLongW(top, -20) | 0x80000 | 0x20 | 0x08000000 | 0x80)
+            win.withdraw()
+        except Exception as e:
+            self.log("кольцо долгого нажатия недоступно:", repr(e))
+            return
+        pt = wintypes.POINT()
+        st = {"on": False, "t0": 0.0, "pos": None}
+
+        def frame():
+            try:
+                while True:
+                    try:
+                        on = self.q.get_nowait()
+                    except queue.Empty:
+                        break
+                    st["on"], st["t0"], st["pos"] = on, time.time(), None
+                    if on:
+                        win.deiconify()
+                        win.attributes("-topmost", True)
+                    else:
+                        win.withdraw()
+                if st["on"]:
+                    u.GetCursorPos(ctypes.byref(pt))
+                    if st["pos"] != (pt.x, pt.y):
+                        st["pos"] = (pt.x, pt.y)
+                        win.geometry("%dx%d+%d+%d" % (S, S, pt.x - c, pt.y - c))
+                    r = r_end + max(0.0, 0.2 - (time.time() - st["t0"])) / 0.2 * (r_start - r_end)
+                    cv.delete("all")
+                    cv.create_oval(c - r, c - r, c + r, c + r, outline=self.COLOR, width=width)
+            except Exception as e:
+                self.log("кольцо долгого нажатия:", repr(e))
+            root.after(16 if st["on"] else 60, frame)
+
+        frame()
+        root.mainloop()
+
+
 class WinEnv:
     """Всё, что касается Windows: чьё это движение, что под указателем, ввод мыши."""
     GA_ROOT, WM_NCHITTEST, SMTO_ABORTIFHUNG, HTCLIENT = 2, 0x0084, 0x0002, 1
@@ -277,7 +373,15 @@ class WinEnv:
                                           wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t)]
         u.SendMessageTimeoutW.restype = ctypes.c_ssize_t
         u.mouse_event.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_size_t]
-        self._notch = None
+        u.GetParent.argtypes = [wintypes.HWND]
+        u.GetParent.restype = wintypes.HWND
+        u.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+        u.GetWindowLongW.restype = ctypes.c_long
+        u.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+        u.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+        self._scale = None
+        # кольцо долгого нажатия живёт в своём потоке с окном Tk
+        self.mark_win = HoldMark(u, self.scale(), self.log) if cfg.get("touch_mark", True) else None
 
     def from_remote(self):
         return self.watcher.mouse_from_remote()
@@ -307,15 +411,16 @@ class WinEnv:
     def px_per_notch(self):
         """Сколько пикселей пути указателя соответствует одному делению колеса (в браузерах это 100 «логических» пикселей)."""
         v = self.cfg.get("touch_scroll_px_per_notch") or 0
-        if v:
-            return float(v)
-        if self._notch is None:
+        return float(v) if v else 100.0 * self.scale()
+
+    def scale(self):
+        """Масштаб экрана (3,0 = 300%): пиксели физические, а размеры интерфейса считаем от логических."""
+        if self._scale is None:
             try:
-                scale = self.u.GetDpiForSystem() / 96.0
+                self._scale = self.u.GetDpiForSystem() / 96.0
             except Exception:
-                scale = 1.0
-            self._notch = 100.0 * scale
-        return self._notch
+                self._scale = 1.0
+        return self._scale
 
     def wheel(self, delta):
         self.u.mouse_event(self.WHEEL, 0, 0, delta & 0xFFFFFFFF, 0)
@@ -337,6 +442,10 @@ class WinEnv:
             winsound.Beep(1100, 25)
         except Exception:
             pass
+
+    def mark(self, on):
+        if self.mark_win:
+            (self.mark_win.show if on else self.mark_win.hide)()
 
 
 def create(watcher, cfg, log=None):

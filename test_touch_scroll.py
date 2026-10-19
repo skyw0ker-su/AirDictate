@@ -40,6 +40,9 @@ class FakeEnv:
     def beep(self):
         self.calls.append(("beep",))
 
+    def mark(self, on):
+        self.calls.append(("mark", on))
+
     def wheels(self):
         return [c[1] for c in self.calls if c[0] == "wheel"]
 
@@ -201,7 +204,8 @@ class LongPress(unittest.TestCase):
 
     def test_hold_without_moving_becomes_a_real_press(self):
         t, env, clk = self.pressed()
-        self.assertEqual(env.calls, [("notify",), ("beep",), ("button", True)])
+        # кольцо у указателя есть, звука по умолчанию нет (его может не быть у слушателя)
+        self.assertEqual(env.calls, [("notify",), ("mark", True), ("button", True)])
         self.assertEqual(t.state, ts.DRAG)
         self.assertTrue(t.pressed)
 
@@ -213,18 +217,51 @@ class LongPress(unittest.TestCase):
         t, env, clk = self.pressed()
         self.assertTrue(t.hook(UP, 540, 520))
         t.process()
-        self.assertEqual(env.calls[-2:], [("button", True), ("button", False)])
+        self.assertEqual(env.calls[-3:], [("button", True), ("button", False), ("mark", False)])
         self.assertEqual(t.state, ts.IDLE)
         self.assertFalse(t.pressed)
+        self.assertFalse(t.marked)
 
     def test_moves_are_held_until_the_press_is_delivered(self):
         t, env, clk = make()
         t.state, t.pressed = ts.DRAG, False
         self.assertTrue(t.hook(MOVE, 540, 520))
 
-    def test_beep_can_be_turned_off(self):
-        t, env, clk = self.pressed(touch_beep=False)
+    def test_beep_is_optional(self):
+        t, env, clk = self.pressed(touch_beep=True)
+        self.assertEqual(env.calls, [("notify",), ("mark", True), ("beep",), ("button", True)])
+
+    def test_ring_can_be_turned_off(self):
+        t, env, clk = self.pressed(touch_mark=False)
         self.assertEqual(env.calls, [("notify",), ("button", True)])
+        t.hook(UP, 540, 520)
+        t.process()
+        self.assertNotIn(("mark", False), env.calls)
+
+    def test_ring_goes_away_when_a_stuck_drag_is_reset(self):
+        t, env, clk = self.pressed()
+        clk.advance(ts.STUCK_SECONDS + 1)
+        t.process()
+        t.process()
+        self.assertEqual(env.calls[-2:], [("button", False), ("mark", False)])
+
+    def test_ring_goes_away_on_abort(self):
+        t, env, clk = self.pressed()
+        t.abort()
+        self.assertEqual(env.calls[-2:], [("button", False), ("mark", False)])
+        self.assertFalse(t.marked)
+
+    def test_scroll_and_tap_never_show_the_ring(self):
+        t, env, clk = make()
+        t.hook(DOWN, 500, 500)
+        step(t, 60)
+        t.process()
+        t.hook(UP, 500, 500)
+        t.process()
+        t.hook(DOWN, 500, 500)
+        t.hook(UP, 500, 500)
+        t.process()
+        self.assertNotIn(("mark", True), env.calls)
 
     def test_long_press_time_is_configurable(self):
         t, env, clk = make(touch_long_press=1.0)
@@ -248,7 +285,7 @@ class LongPress(unittest.TestCase):
     def test_close_releases_a_held_button(self):
         t, env, clk = self.pressed()
         t.close()
-        self.assertEqual(env.calls[-1], ("button", False))
+        self.assertEqual(env.calls[-2:], [("button", False), ("mark", False)])
         self.assertFalse(t.pressed)
 
     def test_new_press_while_dragging_releases_the_old_one(self):
